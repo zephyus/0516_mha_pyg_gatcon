@@ -337,7 +337,22 @@ class NCMultiAgentPolicy(Policy):
         # --- 2) identical==True 的 logits/metrics 批量處理 ---
         if self.identical:
             logits_B_N_A = self.actor_heads[0](h_B_N_H)        # (B,N,A)
-            values_B_N   = self.ppo_value_heads[0](h_B_N_H).squeeze(-1) # (B,N)
+
+            critic_inputs_list = []
+            for i in range(self.n_agent):
+                h_i = h_B_N_H[:, i, :]
+                neighbor_indices = self.neighbor_index_ls[i].to(actions_B_N.device)
+                if neighbor_indices.numel() == 0:
+                    critic_inputs_list.append(h_i)
+                    continue
+                neighbor_actions = actions_B_N[:, neighbor_indices]
+                neighbor_actions_one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).float()
+                neighbor_actions_flat = neighbor_actions_one_hot.view(h_B_N_H.size(0), -1)
+                critic_input_i = torch.cat([h_i, neighbor_actions_flat], dim=1)
+                critic_inputs_list.append(critic_input_i)
+
+            critic_input_B_N_Dnew = torch.stack(critic_inputs_list, dim=1)
+            values_B_N   = self.ppo_value_heads[0](critic_input_B_N_Dnew).squeeze(-1) # (B,N)
 
             flat_logits  = logits_B_N_A.reshape(-1, logits_B_N_A.size(-1)) # (B*N, A)
             flat_actions = actions_B_N.reshape(-1) # (B*N)
@@ -350,9 +365,23 @@ class NCMultiAgentPolicy(Policy):
         else:
             logits_list, values_list = [], []
             for i, (actor_h, value_h) in enumerate(zip(self.actor_heads, self.ppo_value_heads)):
-                # h_B_N_H[:, i, :] gives (B, H) for agent i
                 logits_i_B_A = actor_h(h_B_N_H[:, i, :])            # (B,A_i)
-                values_i_B   = value_h(h_B_N_H[:, i, :]).squeeze(-1) # (B)
+
+                h_i = h_B_N_H[:, i, :]
+                neighbor_indices = self.neighbor_index_ls[i].to(actions_B_N.device)
+                if neighbor_indices.numel() == 0:
+                    critic_input_i = h_i
+                else:
+                    neighbor_one_hot_list = []
+                    for k, neighbor_id in enumerate(neighbor_indices):
+                        neighbor_action = actions_B_N[:, neighbor_id]
+                        num_classes = self.na_ls_ls[i][k]
+                        neighbor_one_hot = F.one_hot(neighbor_action, num_classes=num_classes).float()
+                        neighbor_one_hot_list.append(neighbor_one_hot)
+                    tensors_to_cat = [h_i] + neighbor_one_hot_list
+                    critic_input_i = torch.cat(tensors_to_cat, dim=1)
+
+                values_i_B = value_h(critic_input_i).squeeze(-1) # (B)
                 logits_list.append(logits_i_B_A)
                 values_list.append(values_i_B)
 
@@ -522,7 +551,7 @@ class NCMultiAgentPolicy(Policy):
             self._init_actor_head(n_a)
             self._init_critic_head(n_na)
 
-            ppo_v = nn.Linear(self.n_h, 1)
+            ppo_v = nn.Linear(self.n_h + n_na, 1)
             init_layer(ppo_v, 'fc')
             self.ppo_value_heads.append(ppo_v)
 
