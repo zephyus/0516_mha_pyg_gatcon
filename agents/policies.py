@@ -248,7 +248,8 @@ class NCMultiAgentPolicy(Policy):
         # Patch-04: Replace vs_placeholder with actual values from PPO value heads
         vs_list_N_of_T = []
         for i in range(self.n_agent):
-            val_i_T = self.ppo_value_heads[i](hs_N_T_H[i]).squeeze(-1)
+            critic_input_i = self._build_value_input(hs_N_T_H[i], acts_T_N, i)
+            val_i_T = self.ppo_value_heads[i](critic_input_i).squeeze(-1)
             vs_list_N_of_T.append(val_i_T)
         vs_T_N = torch.stack(vs_list_N_of_T, dim=1)
 
@@ -296,13 +297,7 @@ class NCMultiAgentPolicy(Policy):
         value_list_N_of_1 = []
         for i in range(self.n_agent):
             h_i = h_states_N_H[i, :].unsqueeze(0)  # (1, H)
-            _, _, n_na, _, _ = self._get_neighbor_dim(i)
-            if n_na == 0:
-                critic_input_i = h_i
-            else:
-                dummy_neighbor_actions = torch.zeros(1, n_na, device=h_i.device)
-                critic_input_i = torch.cat([h_i, dummy_neighbor_actions], dim=1)
-
+            critic_input_i = self._build_value_input(h_i, None, i)
             v_i = self.ppo_value_heads[i](critic_input_i).squeeze(-1)
             value_list_N_of_1.append(v_i)
 
@@ -345,19 +340,11 @@ class NCMultiAgentPolicy(Policy):
         # --- 2) identical==True 的 logits/metrics 批量處理 ---
         if self.identical:
             logits_B_N_A = self.actor_heads[0](h_B_N_H)        # (B,N,A)
-
             critic_inputs_list = []
             for i in range(self.n_agent):
-                h_i = h_B_N_H[:, i, :]
-                neighbor_indices = self.neighbor_index_ls[i].to(actions_B_N.device)
-                if neighbor_indices.numel() == 0:
-                    critic_inputs_list.append(h_i)
-                    continue
-                neighbor_actions = actions_B_N[:, neighbor_indices]
-                neighbor_actions_one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).float()
-                neighbor_actions_flat = neighbor_actions_one_hot.view(h_B_N_H.size(0), -1)
-                critic_input_i = torch.cat([h_i, neighbor_actions_flat], dim=1)
-                critic_inputs_list.append(critic_input_i)
+                critic_inputs_list.append(
+                    self._build_value_input(h_B_N_H[:, i, :], actions_B_N, i)
+                )
 
             critic_input_B_N_Dnew = torch.stack(critic_inputs_list, dim=1)
             values_B_N   = self.ppo_value_heads[0](critic_input_B_N_Dnew).squeeze(-1) # (B,N)
@@ -375,20 +362,7 @@ class NCMultiAgentPolicy(Policy):
             for i, (actor_h, value_h) in enumerate(zip(self.actor_heads, self.ppo_value_heads)):
                 logits_i_B_A = actor_h(h_B_N_H[:, i, :])            # (B,A_i)
 
-                h_i = h_B_N_H[:, i, :]
-                neighbor_indices = self.neighbor_index_ls[i].to(actions_B_N.device)
-                if neighbor_indices.numel() == 0:
-                    critic_input_i = h_i
-                else:
-                    neighbor_one_hot_list = []
-                    for k, neighbor_id in enumerate(neighbor_indices):
-                        neighbor_action = actions_B_N[:, neighbor_id]
-                        num_classes = self.na_ls_ls[i][k]
-                        neighbor_one_hot = F.one_hot(neighbor_action, num_classes=num_classes).float()
-                        neighbor_one_hot_list.append(neighbor_one_hot)
-                    tensors_to_cat = [h_i] + neighbor_one_hot_list
-                    critic_input_i = torch.cat(tensors_to_cat, dim=1)
-
+                critic_input_i = self._build_value_input(h_B_N_H[:, i, :], actions_B_N, i)
                 values_i_B = value_h(critic_input_i).squeeze(-1) # (B)
                 logits_list.append(logits_i_B_A)
                 values_list.append(values_i_B)
@@ -481,6 +455,56 @@ class NCMultiAgentPolicy(Policy):
                 ns_ls.append(self.n_s_ls[j])
                 na_ls.append(self.n_a_ls[j])
             return n_n, self.n_s_ls[i_agent] + sum(ns_ls), sum(na_ls), ns_ls, na_ls
+
+    def _build_value_input(self, h_tensor, actions_tensor, agent_id):
+        """Construct critic input by concatenating one-hot neighbor actions.
+
+        Parameters
+        ----------
+        h_tensor : torch.Tensor
+            Hidden states for agent ``agent_id`` with shape ``(B_or_T, H)``.
+        actions_tensor : torch.Tensor or None
+            Tensor containing all agents' actions with shape ``(B_or_T, N)``. If
+            ``None`` a zero placeholder will be used for neighbor actions.
+        agent_id : int
+            Which agent's neighbor configuration to use.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape ``(B_or_T, H + n_na)`` suitable for the
+            corresponding value head.
+        """
+
+        _, _, n_na, _, _ = self._get_neighbor_dim(agent_id)
+        if n_na == 0:
+            return h_tensor
+
+        device = h_tensor.device
+
+        if actions_tensor is None:
+            pad = torch.zeros(h_tensor.size(0), n_na, device=device)
+            return torch.cat([h_tensor, pad], dim=1)
+
+        neighbor_indices = self.neighbor_index_ls[agent_id].to(actions_tensor.device)
+        if neighbor_indices.numel() == 0:
+            pad = torch.zeros(h_tensor.size(0), n_na, device=actions_tensor.device)
+            return torch.cat([h_tensor, pad], dim=1)
+
+        if self.identical:
+            neighbor_actions = actions_tensor[:, neighbor_indices]
+            one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).float()
+            flat = one_hot.view(h_tensor.size(0), -1)
+            return torch.cat([h_tensor, flat], dim=1)
+        else:
+            segs = []
+            for k, n_id in enumerate(neighbor_indices):
+                act = actions_tensor[:, n_id]
+                n_dim = self.na_ls_ls[agent_id][k]
+                seg = F.one_hot(act, num_classes=n_dim).float()
+                segs.append(seg)
+            cat = torch.cat(segs, dim=1) if segs else torch.zeros(h_tensor.size(0), 0, device=actions_tensor.device)
+            return torch.cat([h_tensor, cat], dim=1)
 
     def _init_actor_head(self, n_a):
         actor_head = nn.Linear(self.n_h, n_a)
