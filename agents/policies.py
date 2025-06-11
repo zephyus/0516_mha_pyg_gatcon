@@ -195,8 +195,6 @@ class NCMultiAgentPolicy(Policy):
     def __init__(self, n_s, n_a, n_agent, n_step, neighbor_mask, n_fc=64, n_h=64,
                  n_s_ls=None, n_a_ls=None, model_config=None, identical=True):
         super(NCMultiAgentPolicy, self).__init__(n_a, n_s, n_step, 'nc', None, identical)
-        # Ensure device attribute exists early so helper methods can safely use it
-        self.device = torch.device("cpu")
         if not self.identical:
             self.n_s_ls = n_s_ls
             self.n_a_ls = n_a_ls
@@ -222,13 +220,6 @@ class NCMultiAgentPolicy(Policy):
 
         self._init_net() # self.use_gat is now set before this call
 
-        if list(self.parameters()):
-            self.device = next(self.parameters()).device
-        else:
-            # If no parameters (e.g. GAT disabled and no other layers yet)
-            self.device = torch.device("cpu")
-            logging.warning(f"[{self.name}] No parameters found after _init_net. Defaulting device to CPU.")
-
         self._reset()
         self.zero_pad = nn.Parameter(torch.zeros(1, 2*self.n_fc), requires_grad=False)
         self.latest_attention_scores = None
@@ -239,7 +230,7 @@ class NCMultiAgentPolicy(Policy):
         try:
             return next(self.parameters()).device
         except StopIteration:
-            return getattr(self, "device", torch.device("cpu"))
+            return torch.device("cpu")
 
     def load_state_dict(self, state_dict, strict=True):
         if 'use_gat_flag' in state_dict:
@@ -655,8 +646,10 @@ class NCMultiAgentPolicy(Policy):
 
         max_n_na = 0
         if self.identical:
-            # Use the theoretical maximum so future topology changes won't exceed the head's capacity
-            max_n_na = (self.n_agent - 1) * self.n_a
+            # compute maximum neighbour-action dimension among all agents
+            dims = [self._get_neighbor_dim(i)[2] for i in range(self.n_agent)]
+            if dims:
+                max_n_na = max(dims)
             self.shared_value_head = nn.Linear(self.n_h + max_n_na, 1)
             init_layer(self.shared_value_head, 'fc')
             self._init_actor_head(self.n_a)
@@ -670,7 +663,7 @@ class NCMultiAgentPolicy(Policy):
             if n_n:
                 max_dim = n_na
                 if self.identical:
-                    max_dim = (self.n_agent - 1) * self.n_a
+                    max_dim = max_n_na
                 fc_p_layer = nn.Linear(max_dim, self.n_fc)
                 init_layer(fc_p_layer, 'fc')
                 fc_m_layer = nn.Linear(self.n_h * n_n, self.n_fc)
@@ -688,9 +681,7 @@ class NCMultiAgentPolicy(Policy):
                 init_layer(ppo_v, 'fc')
                 self.ppo_value_heads.append(ppo_v)
 
-        if list(self.parameters()):
-            self.device = next(self.parameters()).device
-        else:
+        if not list(self.parameters()):
             logging.warning(f"[{self.name}] cannot infer device in _init_net.")
 
         # Cache neighbor indices as a list of LongTensors
@@ -743,7 +734,12 @@ class NCMultiAgentPolicy(Policy):
             # gather neighbor h, obs, fp  —— 利用 flatten trick
             if n_n:
                 # 先算展平 index:  t_idx* N + nei_j
-                base  = torch.arange(T, device=device).unsqueeze(1) * N       # (T,1)
+                if not hasattr(self, '_arange_cache'):
+                    self._arange_cache = {}
+                key = (T, device)
+                if key not in self._arange_cache:
+                    self._arange_cache[key] = torch.arange(T, device=device).unsqueeze(1)
+                base  = self._arange_cache[key] * N       # (T,1)
                 idx_flat = (base + idx_nei.unsqueeze(0)).reshape(-1)          # (T*n_n,)
                 # → 取鄰居 hidden
                 m_i_flat  = h_repeat[idx_flat].reshape(T, n_n*H)              # (T, n_n*H)
@@ -826,6 +822,8 @@ class NCMultiAgentPolicy(Policy):
         s_block_input = s_flat_TN_D
         # Patch: Update GAT condition
         if self.use_gat and self.gat_layer is not None:
+            if s_flat_TN_D.numel() == 0:
+                return s_flat_TN_D
             if self.use_layer_norm and hasattr(self, 'pre_gat_ln'):
                 s_input_for_gat = self.pre_gat_ln(s_block_input)
             else:
@@ -837,10 +835,14 @@ class NCMultiAgentPolicy(Policy):
             if s_flat_TN_D.shape[0] % num_nodes_per_graph != 0:
                 raise ValueError("s_flat_TN_D cannot be reshaped to (T,N,D) for batched GAT processing.")
 
-            edge_index_list = []
-            for i in range(num_graphs):
-                edge_index_list.append(self.edge_index + i * num_nodes_per_graph)
-            batched_edge_index = torch.cat(edge_index_list, dim=1).to(s_input_for_gat.device)
+            if not hasattr(self, '_edge_index_cache'):
+                self._edge_index_cache = {}
+            if num_graphs not in self._edge_index_cache:
+                edge_index_list = [
+                    self.edge_index + i * num_nodes_per_graph for i in range(num_graphs)
+                ]
+                self._edge_index_cache[num_graphs] = torch.cat(edge_index_list, dim=1)
+            batched_edge_index = self._edge_index_cache[num_graphs].to(s_input_for_gat.device)
 
             s_after_gat = self.gat_layer(s_input_for_gat, batched_edge_index)
 
@@ -903,12 +905,11 @@ class NCMultiAgentPolicy(Policy):
         # ────────────────────────────────────────────────
         
         T, N, _ = obs_T_N_Do.shape
-        # device = obs_T_N_Do.device # Already self.device
 
-        h0, c0 = torch.chunk(initial_states_N_2H, 2, dim=1) # initial_states_N_2H is already on self.device
+        h0, c0 = torch.chunk(initial_states_N_2H, 2, dim=1)
 
         if T > 0:
-            initial_done_mask_N = (1.0 - dones_T_N[0].float()).unsqueeze(-1) # dones_T_N is on self.device
+            initial_done_mask_N = (1.0 - dones_T_N[0].float()).unsqueeze(-1)
             h0 = h0 * initial_done_mask_N
             c0 = c0 * initial_done_mask_N
 
