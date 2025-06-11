@@ -295,7 +295,15 @@ class NCMultiAgentPolicy(Policy):
 
         value_list_N_of_1 = []
         for i in range(self.n_agent):
-            v_i = self.ppo_value_heads[i](h_states_N_H[i, :].unsqueeze(0)).squeeze(-1)
+            h_i = h_states_N_H[i, :].unsqueeze(0)  # (1, H)
+            _, _, n_na, _, _ = self._get_neighbor_dim(i)
+            if n_na == 0:
+                critic_input_i = h_i
+            else:
+                dummy_neighbor_actions = torch.zeros(1, n_na, device=h_i.device)
+                critic_input_i = torch.cat([h_i, dummy_neighbor_actions], dim=1)
+
+            v_i = self.ppo_value_heads[i](critic_input_i).squeeze(-1)
             value_list_N_of_1.append(v_i)
 
         probs_list_N_of_A = [F.softmax(logits.squeeze(0), dim=-1) for logits in actor_logits_list_N_of_A]
