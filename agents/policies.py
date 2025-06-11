@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import logging
+import threading
 from agents.utils import batch_to_seq, init_layer, one_hot, run_rnn
 from typing import Optional # Added import
 # Patch: Optional import for torch_geometric
@@ -603,6 +604,7 @@ class NCMultiAgentPolicy(Policy):
         self.actor_heads.append(actor_head)
 
     def _init_net(self):
+        self._fc_x_lock = threading.Lock()
         self.fc_x_layers = nn.ModuleDict()
         self.fc_p_layers = nn.ModuleList()
         self.fc_m_layers = nn.ModuleList()
@@ -929,16 +931,17 @@ class NCMultiAgentPolicy(Policy):
 
     def _get_fc_x(self, agent_id: int, n_n: int, n_ns: int) -> nn.Linear:
         key = f'agent_{agent_id}_nn_{n_n}_in{n_ns}'
-        if key not in self.fc_x_layers:
-            logging.info(f"Creating fc_x layer: {key} (in={n_ns})")
-            layer = nn.Linear(n_ns, self.n_fc)
-            init_layer(layer, 'fc')
-            layer = layer.to(self.dev)
-            self.fc_x_layers[key] = layer
-        else:
-            assert self.fc_x_layers[key].in_features == n_ns, \
-                f"fc_x[{key}] expects {self.fc_x_layers[key].in_features}, got {n_ns}"
-        return self.fc_x_layers[key]
+        with self._fc_x_lock:
+            if key not in self.fc_x_layers:
+                logging.info(f"Creating fc_x layer: {key} (in={n_ns})")
+                layer = nn.Linear(n_ns, self.n_fc)
+                init_layer(layer, 'fc')
+                layer = layer.to(self.dev)
+                self.fc_x_layers[key] = layer
+            else:
+                assert self.fc_x_layers[key].in_features == n_ns, \
+                    f"fc_x[{key}] expects {self.fc_x_layers[key].in_features}, got {n_ns}"
+            return self.fc_x_layers[key]
 
 
 class NCLMMultiAgentPolicy(NCMultiAgentPolicy):
