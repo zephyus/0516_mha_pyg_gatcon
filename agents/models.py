@@ -165,8 +165,7 @@ class IA2C:
         #先叫出一個policy，然後把它丟進GPU or CPU去跑 🆒
         self.policy = self._init_policy()
         self.policy.to(self.device)
-        # --- 同步 device 欄位並重建 hidden states 在正確裝置 ---
-        self.policy.device = self.device
+        # --- 重建 hidden states 在正確裝置 ---
         if hasattr(self.policy, "_reset"):
             self.policy._reset()
         
@@ -525,10 +524,10 @@ class MA2PPO_NC(MA2C_NC):
         # ---------- freeze dropout but 保留 train() ----------
         gat_orig_p  = None
         lstm_orig_p = None
-        if hasattr(self.policy, 'gat_layer'):
+        if getattr(self.policy, 'gat_layer', None) is not None:
             gat_orig_p = float(self.policy.gat_layer.dropout)
             self.policy.gat_layer.dropout = 0.0
-        if hasattr(self.policy, 'lstm_layer'):
+        if getattr(self.policy, 'lstm_layer', None) is not None:
             lstm_orig_p = float(self.policy.lstm_layer.dropout)
             self.policy.lstm_layer.dropout = 0.0
 
@@ -587,9 +586,9 @@ class MA2PPO_NC(MA2C_NC):
                 updates += 1
 
         # ---------- 恢復原來的 dropout ----------
-        if gat_orig_p is not None:
+        if gat_orig_p is not None and getattr(self.policy, 'gat_layer', None) is not None:
             self.policy.gat_layer.dropout = gat_orig_p
-        if lstm_orig_p is not None:
+        if lstm_orig_p is not None and getattr(self.policy, 'lstm_layer', None) is not None:
             self.policy.lstm_layer.dropout = lstm_orig_p
 
         if self.lr_decay!='constant' and global_step is not None:
