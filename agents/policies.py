@@ -510,20 +510,28 @@ class NCMultiAgentPolicy(Policy):
             return h_tensor
 
         device = h_tensor.device
+        if self.identical:
+            target_dim = self.ppo_value_heads[0].in_features - self.n_h
+        else:
+            target_dim = n_na
 
         if actions_tensor is None:
-            pad = torch.zeros(h_tensor.size(0), n_na, device=device)
+            pad = torch.zeros(h_tensor.size(0), target_dim, device=device)
             return torch.cat([h_tensor, pad], dim=1)
 
         neighbor_indices = self.neighbor_index_ls[agent_id].to(actions_tensor.device)
         if neighbor_indices.numel() == 0:
-            pad = torch.zeros(h_tensor.size(0), n_na, device=actions_tensor.device)
+            pad = torch.zeros(h_tensor.size(0), target_dim, device=actions_tensor.device)
             return torch.cat([h_tensor, pad], dim=1)
 
         if self.identical:
             neighbor_actions = actions_tensor[:, neighbor_indices]
             one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).float()
             flat = one_hot.view(h_tensor.size(0), -1)
+            pad_dim = target_dim - flat.size(1)
+            if pad_dim > 0:
+                padding = torch.zeros(h_tensor.size(0), pad_dim, device=h_tensor.device)
+                flat = torch.cat([flat, padding], dim=1)
             return torch.cat([h_tensor, flat], dim=1)
         else:
             segs = []
@@ -540,17 +548,11 @@ class NCMultiAgentPolicy(Policy):
         init_layer(actor_head, 'fc')
         self.actor_heads.append(actor_head)
 
-    def _init_critic_head(self, n_na):
-        critic_head = nn.Linear(self.n_h + n_na, 1)
-        init_layer(critic_head, 'fc')
-        self.critic_heads.append(critic_head)
-
     def _init_net(self):
         self.fc_x_layers = nn.ModuleDict()
         self.fc_p_layers = nn.ModuleList()
         self.fc_m_layers = nn.ModuleList()
         self.actor_heads = nn.ModuleList()
-        self.critic_heads = nn.ModuleList()
         self.ppo_value_heads = nn.ModuleList()
         self.ns_ls_ls = []
         self.na_ls_ls = []
@@ -592,6 +594,14 @@ class NCMultiAgentPolicy(Policy):
             logging.warning(f"[{self.name}] GAT is configured (use_gat=True) but GAT layer object is None (likely due to import error or config).")
 
 
+        max_n_na = 0
+        if self.identical:
+            n_na_candidates = [self._get_neighbor_dim(i)[2] for i in range(self.n_agent)]
+            if n_na_candidates:
+                max_n_na = max(n_na_candidates)
+            self.shared_value_head = nn.Linear(self.n_h + max_n_na, 1)
+            init_layer(self.shared_value_head, 'fc')
+
         for i in range(self.n_agent):
             n_n, n_ns, n_na, ns_ls, na_ls = self._get_neighbor_dim(i)
             self.ns_ls_ls.append(ns_ls)
@@ -610,11 +620,13 @@ class NCMultiAgentPolicy(Policy):
 
             n_a = self.n_a if self.identical else self.n_a_ls[i]
             self._init_actor_head(n_a)
-            self._init_critic_head(n_na)
 
-            ppo_v = nn.Linear(self.n_h + n_na, 1)
-            init_layer(ppo_v, 'fc')
-            self.ppo_value_heads.append(ppo_v)
+            if self.identical:
+                self.ppo_value_heads.append(self.shared_value_head)
+            else:
+                ppo_v = nn.Linear(self.n_h + n_na, 1)
+                init_layer(ppo_v, 'fc')
+                self.ppo_value_heads.append(ppo_v)
 
         if list(self.parameters()):
             self.device = next(self.parameters()).device

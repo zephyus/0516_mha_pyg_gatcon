@@ -96,6 +96,17 @@ def test_forward_with_actions(dummy_policy):
     assert isinstance(value_list,  list) and len(value_list)  == N
     assert isinstance(prob_list,   list) and len(prob_list)   == N
 
+def test_critic_input_padding(dummy_policy):
+    B = 2
+    N = dummy_policy.n_agent
+    h = torch.zeros(B, dummy_policy.n_h)
+    acts = torch.zeros(B, N, dtype=torch.long)
+
+    expected_dim = dummy_policy.shared_value_head.in_features
+    for i in range(N):
+        inp = dummy_policy._build_value_input(h, acts, i)
+        assert inp.size(1) == expected_dim
+
 def test_backward_computes_loss_and_grad(dummy_policy):
     agent = dummy_policy
     T, N, Do = 3, agent.n_agent, agent.n_s
