@@ -276,7 +276,31 @@ class NCMultiAgentPolicy(Policy):
                 self.entropy_loss,
                 self.loss)
 
-    def forward(self, ob_N_Do, done_N, fp_N_Dfp, action=None, out_type='p'):
+    def forward(self, ob_N_Do, done_N, fp_N_Dfp, neighbor_actions_N=None, action=None, out_type='p'):
+        """Run actor (and optionally critic) for a single timestep.
+
+        Parameters
+        ----------
+        ob_N_Do : np.ndarray
+            Observation array with shape ``(N, obs_dim)``.
+        done_N : np.ndarray
+            Done flags for each agent.
+        fp_N_Dfp : np.ndarray
+            Fingerprint features for each agent.
+        neighbor_actions_N : optional, array-like or Tensor
+            If provided, should contain all agents' actions with shape ``(N,)``.
+            When present, value predictions will be returned; otherwise the
+            second element of the returned tuple will be ``None``.
+
+        Returns
+        -------
+        List[Tensor]
+            Actor logits for each agent.
+        Optional[List[Tensor]]
+            Value estimates if ``neighbor_actions_N`` is given, else ``None``.
+        List[Tensor]
+            Action probabilities for each agent.
+        """
         device = self.actor_heads[0].weight.device
 
         obs_T1_N_Do = torch.from_numpy(ob_N_Do).float().unsqueeze(0).to(device)
@@ -294,19 +318,25 @@ class NCMultiAgentPolicy(Policy):
         for i in range(self.n_agent):
             actor_logits_list_N_of_A.append(self.actor_heads[i](h_states_N_H[i, :].unsqueeze(0)))
 
-        value_list_N_of_1 = []
-        for i in range(self.n_agent):
-            h_i = h_states_N_H[i, :].unsqueeze(0)  # (1, H)
-            critic_input_i = self._build_value_input(h_i, None, i)
-            v_i = self.ppo_value_heads[i](critic_input_i).squeeze(-1)
-            value_list_N_of_1.append(v_i)
+        value_list_N_of_1 = None
+        if neighbor_actions_N is not None:
+            act_tensor = torch.as_tensor(neighbor_actions_N, dtype=torch.long, device=device).unsqueeze(0)
+            value_list_N_of_1 = []
+            for i in range(self.n_agent):
+                h_i = h_states_N_H[i, :].unsqueeze(0)  # (1, H)
+                critic_input_i = self._build_value_input(h_i, act_tensor, i)
+                v_i = self.ppo_value_heads[i](critic_input_i).squeeze(-1)
+                value_list_N_of_1.append(v_i)
 
         probs_list_N_of_A = [F.softmax(logits.squeeze(0), dim=-1) for logits in actor_logits_list_N_of_A]
 
         self.states_fw = new_states_N_2H.detach()
 
         actor_logits_squeezed = [lg.squeeze(0) for lg in actor_logits_list_N_of_A]
-        value_list_squeezed = [val.squeeze(0) if val.numel() == 1 else val for val in value_list_N_of_1]
+        if value_list_N_of_1 is not None:
+            value_list_squeezed = [val.squeeze(0) if val.numel() == 1 else val for val in value_list_N_of_1]
+        else:
+            value_list_squeezed = None
 
         return actor_logits_squeezed, value_list_squeezed, probs_list_N_of_A
     
