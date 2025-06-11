@@ -83,27 +83,13 @@ url={https://openreview.net/forum?id=Syx7A3NFvH}
 
 --- Run on docker instructions ---
 
-以下是針對您新的實驗資料夾與設定檔 `/home/russell512/deeprl_0611_ppo/config/config_mappo_nc_net_exp_0519.ini` 的完整操作指引，已將相關路徑與容器名稱更新：
+以下是**從啟動 Docker 容器到完成 PPO 訓練（使用 `config/config_mappo_0611_noMHA_simplest.ini`）的完整指令流程**，適合直接複製貼上：
 
 ---
 
-## ✅ **完全 WORK for PPO 實驗 - deeprl\_0611\_ppo**
+## ✅ PPO 訓練全流程（含 PyG 支援 + 日誌輸出）
 
-### 🎯目標：使用 Docker + tmux 讓訓練在背景穩定持續執行，不受 SSH 斷線影響
-
----
-
-## **更新參數說明**
-
-* **專案資料夾**：`/home/russell512/deeprl_0611_ppo`
-* **config 檔案**：`config/config_mappo_nc_net_exp_0519.ini`
-* **容器名稱建議**：`Trainer_PPO_0611`
-* **TensorBoard logdir**：`/home/russell512/deeprl_0611_ppo/real_a1`
-* **Port 建議**：199（避免與其他實驗衝突）
-
----
-
-### 🧱 **第 1 步：建置 Docker Image**
+### 🧱 第 1 步：建置 Docker Image（如已建好可略過）
 
 ```bash
 cd ~/best_environment
@@ -112,104 +98,118 @@ docker build -t best_environment:latest .
 
 ---
 
-### 🚀 **第 2 步：啟動背景容器**
+### 🚀 第 2 步：啟動背景 Docker 容器
 
 ```bash
 docker run \
   --gpus all \
   -d \
-  --name Trainer_PPO_0611 \
+  --name Trainer_PPO_0611_v2 \
   -v /home/russell512/deeprl_0611_ppo:/workspace/my_deeprl_network \
   best_environment:latest \
   sleep infinity
 ```
 
+> ✅ *注意容器名稱唯一，若重複請先刪除：`docker rm Trainer_PPO_0611_v2`*
+
 ---
 
-### 🔧 **第 3 步：進入容器**
+### 🔧 第 3 步：進入容器
 
 ```bash
-docker exec -it Trainer_PPO_0611 /bin/bash
+docker exec -it Trainer_PPO_0611_v2 /bin/bash
 ```
 
 ---
 
-### 🔩 **第 4 步：環境設置**
+### 🔩 第 4 步：安裝套件與環境（含 PyG）
 
 ```bash
+# Python 套件安裝
 pip install traci sumolib torch
 
+# 安裝 PyG 相依套件
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv \
+  -f https://data.pyg.org/whl/torch-1.9.0+cu111.html
+
+pip install torch-geometric
+
+# 進入工作資料夾
 cd /workspace/my_deeprl_network
 
+# 設定 SUMO 路徑（如果需要）
 export SUMO_HOME="/root/miniconda/envs/py36/share/sumo"
 
-apt update
-apt install -y tmux
+# 安裝 tmux（如尚未安裝）
+apt update && apt install -y tmux
 ```
 
 ---
 
-### 🧠 **第 5 步：啟動訓練 (tmux)**
+### 🧠 第 5 步：啟動訓練（使用 tmux）
 
 ```bash
-tmux new -s training_ppo_0611
+tmux new -s training_noMHA_0611
 ```
 
-接著在 tmux 中執行：
+tmux 內執行以下訓練指令：
 
 ```bash
-mkdir -p real_a1/log
+# 設定輸出資料夾與 log
+export BASE_DIR_NAME="real_a1/0611_PPO_noMHA_simplest"
+mkdir -p ${BASE_DIR_NAME}/log
 
+# 啟用 GAT 模組（如不使用可省略或設為 0）
 export USE_GAT=1
+
+# 執行訓練，log 存檔自動加時間戳記
 python3 test.py \
-  --base-dir real_a1 \
-  --port 199 \
-  train \
-  --config-dir config/config_mappo_nc_net_exp_0519.ini \
-  > real_a1/log/training_ppo_0611_$(date +%Y%m%d_%H%M%S).log 2>&1
+    --base-dir ${BASE_DIR_NAME} \
+    --port 206 \
+    train \
+    --config-dir config/config_mappo_0611_noMHA_simplest.ini \
+    > ${BASE_DIR_NAME}/log/training_0611_PPO_noMHA_$(date +%Y%m%d_%H%M%S).log 2>&1
 ```
 
 ---
 
-### 🔚 **第 6、7 步：分離並退出容器**
+### 📤 第 6 步：分離 tmux，並退出容器
 
 ```bash
-# 在 tmux 裡按：Ctrl + b，然後按 d 鍵
-exit  # 回到主機
+# 在 tmux 裡按下：
+Ctrl + b，放開後按 d
+
+# 然後輸入：
+exit
 ```
 
 ---
 
-### 📶 **第 8 步：安全地斷線 SSH**
-
-您現在可以放心中斷 SSH 連線了，訓練仍會在容器 + tmux 中持續執行。
+### 📴 第 7 步：關閉 SSH，訓練仍會持續在容器+tmux 中執行
 
 ---
 
-### 🔁 **第 9 步：重新連線查看訓練**
+### 🔁 第 8 步：日後重連查看訓練
 
 ```bash
 ssh <your-server>
-
-docker exec -it Trainer_PPO_0611 /bin/bash
-
-tmux attach -t training_ppo_0611
+docker exec -it Trainer_PPO_0611_v2 /bin/bash
+tmux attach -t training_noMHA_0611
 ```
 
 ---
 
-### 📈 **啟動 TensorBoard 監控**
+### 📈 可選：啟動 TensorBoard 觀察訓練 log
 
 ```bash
-tensorboard --logdir=/home/russell512/deeprl_0611_ppo/real_a1 --port=6009
+tensorboard --logdir=/home/russell512/deeprl_0611_ppo/real_a1 --port=6010
 ```
 
-然後瀏覽器開啟：
-[http://localhost:6009](http://localhost:6009)
+瀏覽器開啟：[http://localhost:6010](http://localhost:6010)
 
 ---
 
-### 🧹 **監控訓練程序**
+### 🧹 查看正在訓練的 Python 程序（確認是否仍在跑）
 
 ```bash
 ps -eo pid,user,%cpu,%mem,cmd | grep python | grep -v grep
