@@ -194,6 +194,8 @@ class NCMultiAgentPolicy(Policy):
     def __init__(self, n_s, n_a, n_agent, n_step, neighbor_mask, n_fc=64, n_h=64,
                  n_s_ls=None, n_a_ls=None, model_config=None, identical=True):
         super(NCMultiAgentPolicy, self).__init__(n_a, n_s, n_step, 'nc', None, identical)
+        # Ensure device attribute exists early so helper methods can safely use it
+        self.device = torch.device("cpu")
         if not self.identical:
             self.n_s_ls = n_s_ls
             self.n_a_ls = n_a_ls
@@ -533,7 +535,7 @@ class NCMultiAgentPolicy(Policy):
         if self.identical:
             neighbor_actions = actions_tensor[:, neighbor_indices]
             neighbor_actions = neighbor_actions.clamp_(0, self.n_a - 1)
-            one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).float()
+            one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).to(dtype)
             flat = one_hot.view(h_tensor.size(0), -1)
             if flat.size(1) > target_dim:
                 logging.warning(
@@ -551,7 +553,7 @@ class NCMultiAgentPolicy(Policy):
                 act = actions_tensor[:, n_id]
                 n_dim = self.na_ls_ls[agent_id][k]
                 act = act.clamp_(0, n_dim - 1)
-                seg = F.one_hot(act, num_classes=n_dim).float()
+                seg = F.one_hot(act, num_classes=n_dim).to(dtype)
                 segs.append(seg)
             cat = (
                 torch.cat(segs, dim=1)
@@ -603,7 +605,10 @@ class NCMultiAgentPolicy(Policy):
                 dropout=gat_dropout_init
             )
             adj_matrix = torch.tensor(self.neighbor_mask, dtype=torch.float32)
-            adj_matrix = adj_matrix + torch.eye(adj_matrix.size(0), dtype=torch.float32)
+            adj_matrix = torch.maximum(
+                adj_matrix,
+                torch.eye(adj_matrix.size(0), dtype=torch.float32)
+            )
             edge_index = adj_matrix.nonzero(as_tuple=False).t().contiguous()
             self.register_buffer('edge_index', edge_index.long())
 
@@ -904,7 +909,8 @@ class NCMultiAgentPolicy(Policy):
             logging.info(f"Creating fc_x layer: {key} (in={n_ns})")
             layer = nn.Linear(n_ns, self.n_fc)
             init_layer(layer, 'fc')
-            layer = layer.to(self.device)
+            tmp_dev = self.device if getattr(self, 'device', None) else torch.device('cpu')
+            layer = layer.to(tmp_dev)
             self.fc_x_layers[key] = layer
         else:
             assert self.fc_x_layers[key].in_features == n_ns, \
