@@ -340,14 +340,13 @@ class NCMultiAgentPolicy(Policy):
         # --- 2) identical==True 的 logits/metrics 批量處理 ---
         if self.identical:
             logits_B_N_A = self.actor_heads[0](h_B_N_H)        # (B,N,A)
-            critic_inputs_list = []
-            for i in range(self.n_agent):
-                critic_inputs_list.append(
-                    self._build_value_input(h_B_N_H[:, i, :], actions_B_N, i)
-                )
-
-            critic_input_B_N_Dnew = torch.stack(critic_inputs_list, dim=1)
-            values_B_N   = self.ppo_value_heads[0](critic_input_B_N_Dnew).squeeze(-1) # (B,N)
+            critic_inputs_list = [
+                self._build_value_input(h_B_N_H[:, i, :], actions_B_N, i)
+                for i in range(self.n_agent)
+            ]
+            critic_input_flat = torch.cat(critic_inputs_list, dim=0)  # (B*N, D)
+            values_flat = self.ppo_value_heads[0](critic_input_flat)
+            values_B_N = values_flat.view(B, N)
 
             flat_logits  = logits_B_N_A.reshape(-1, logits_B_N_A.size(-1)) # (B*N, A)
             flat_actions = actions_B_N.reshape(-1) # (B*N)
