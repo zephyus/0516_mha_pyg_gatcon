@@ -241,8 +241,8 @@ class NCMultiAgentPolicy(Policy):
 
     def backward(self, obs, fps, acts, dones, Rs, Advs,
                  e_coef, v_coef, summary_writer=None, global_step=None):
-        obs = torch.from_numpy(obs).float().to(self.device, non_blocking=True)
-        fps = torch.from_numpy(fps).float().to(self.device, non_blocking=True)
+        obs = torch.from_numpy(obs).float().to(self.dev, non_blocking=True)
+        fps = torch.from_numpy(fps).float().to(self.dev, non_blocking=True)
         
         dones_np = np.asarray(dones)
         if dones_np.ndim == 1:
@@ -840,13 +840,13 @@ class NCMultiAgentPolicy(Policy):
                          fps_T_N_Dfp=None,
                          initial_states_N_2H=None):
         # ─── 新增：搬到 device ───────────────────────────
-        obs_T_N_Do = obs_T_N_Do.to(self.device)
+        obs_T_N_Do = obs_T_N_Do.to(self.dev)
         if dones_T_N is not None:
-            dones_T_N = dones_T_N.to(self.device)
+            dones_T_N = dones_T_N.to(self.dev)
         if fps_T_N_Dfp is not None:
-            fps_T_N_Dfp = fps_T_N_Dfp.to(self.device)
+            fps_T_N_Dfp = fps_T_N_Dfp.to(self.dev)
         if initial_states_N_2H is not None:
-            initial_states_N_2H = initial_states_N_2H.to(self.device)
+            initial_states_N_2H = initial_states_N_2H.to(self.dev)
         # ── 原有填補 default 的程式碼可保留或調整順序 ──
         if dones_T_N is None:
             # All-False → 代表持續序列
@@ -854,7 +854,7 @@ class NCMultiAgentPolicy(Policy):
                 obs_T_N_Do.size(0),
                 obs_T_N_Do.size(1),
                 dtype=torch.bool,
-                device=self.device
+                device=self.dev
             )
         if fps_T_N_Dfp is None:
             # 若無鄰居 fingerprint，可用 0 占位；shape 保持 (T,N,0) 即可
@@ -866,13 +866,13 @@ class NCMultiAgentPolicy(Policy):
                 obs_T_N_Do.size(0),
                 obs_T_N_Do.size(1),
                 0, # Assuming 0 features for fingerprint if None
-                device=self.device
+                device=self.dev
             )
         if initial_states_N_2H is None:
             H = self.n_h
             N_agents = obs_T_N_Do.size(1)
             initial_states_N_2H = torch.zeros(
-                N_agents, 2*H, device=self.device
+                N_agents, 2*H, device=self.dev
             )
         # ────────────────────────────────────────────────
         
