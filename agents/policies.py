@@ -204,7 +204,10 @@ class NCMultiAgentPolicy(Policy):
         self.model_config = model_config
         # Patch: self.use_gat initialization moved before _init_net
         use_gat_env_value = os.getenv('USE_GAT', '1')
-        logging.info(f"DEBUG: os.getenv('USE_GAT', '1') returned: '{use_gat_env_value}' (type: {type(use_gat_env_value)}")
+        logging.info(
+            f"DEBUG: os.getenv('USE_GAT', '1') returned: '{use_gat_env_value}' "
+            f"(type: {type(use_gat_env_value)})"
+        )
         # self.use_gat will be True if GATConv is available AND environment variable is '1'
         self.use_gat = (GATConv is not None) and (use_gat_env_value == '1')
         if GATConv is None and use_gat_env_value == '1':
@@ -228,8 +231,8 @@ class NCMultiAgentPolicy(Policy):
 
     def backward(self, obs, fps, acts, dones, Rs, Advs,
                  e_coef, v_coef, summary_writer=None, global_step=None):
-        obs = torch.from_numpy(obs).float() 
-        fps = torch.from_numpy(fps).float()
+        obs = torch.from_numpy(obs).float().to(self.device, non_blocking=True)
+        fps = torch.from_numpy(fps).float().to(self.device, non_blocking=True)
         
         dones_np = np.asarray(dones)
         if dones_np.ndim == 1:
@@ -330,7 +333,7 @@ class NCMultiAgentPolicy(Policy):
 
         probs_list_N_of_A = [F.softmax(logits.squeeze(0), dim=-1) for logits in actor_logits_list_N_of_A]
 
-        self.states_fw = new_states_N_2H.detach()
+        self.states_fw = new_states_N_2H.detach().to(device)
 
         actor_logits_squeezed = [lg.squeeze(0) for lg in actor_logits_list_N_of_A]
         if value_list_N_of_1 is not None:
@@ -358,6 +361,8 @@ class NCMultiAgentPolicy(Policy):
         """
         B, N, _ = obs_B_N_D.shape                       # 取 batch 與 agent 數
 
+        actions_B_N = actions_B_N.to(obs_B_N_D.device)
+
         # --- 1) 先拿到 (N,B,H) → 轉 (B,N,H) ---
         h_N_B_H, lstm_states_new = self._run_comm_layers(
                 obs_B_N_D,
@@ -375,7 +380,7 @@ class NCMultiAgentPolicy(Policy):
                 for i in range(self.n_agent)
             ]
             critic_input_flat = torch.cat(critic_inputs_list, dim=0)  # (B*N, D)
-            values_flat = self.ppo_value_heads[0](critic_input_flat)
+            values_flat = self.ppo_value_heads[0](critic_input_flat).squeeze(-1)
             values_B_N = values_flat.view(B, N)
 
             flat_logits  = logits_B_N_A.reshape(-1, logits_B_N_A.size(-1)) # (B*N, A)
@@ -510,27 +515,34 @@ class NCMultiAgentPolicy(Policy):
             return h_tensor
 
         device = h_tensor.device
+        dtype = h_tensor.dtype
         if self.identical:
             target_dim = self.ppo_value_heads[0].in_features - self.n_h
         else:
             target_dim = n_na
 
         if actions_tensor is None:
-            pad = torch.zeros(h_tensor.size(0), target_dim, device=device)
+            pad = torch.zeros(h_tensor.size(0), target_dim, device=device, dtype=dtype)
             return torch.cat([h_tensor, pad], dim=1)
 
         neighbor_indices = self.neighbor_index_ls[agent_id].to(actions_tensor.device)
         if neighbor_indices.numel() == 0:
-            pad = torch.zeros(h_tensor.size(0), target_dim, device=actions_tensor.device)
+            pad = torch.zeros(h_tensor.size(0), target_dim, device=actions_tensor.device, dtype=dtype)
             return torch.cat([h_tensor, pad], dim=1)
 
         if self.identical:
             neighbor_actions = actions_tensor[:, neighbor_indices]
+            neighbor_actions = neighbor_actions.clamp_(0, self.n_a - 1)
             one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).float()
             flat = one_hot.view(h_tensor.size(0), -1)
-            pad_dim = target_dim - flat.size(1)
-            if pad_dim > 0:
-                padding = torch.zeros(h_tensor.size(0), pad_dim, device=h_tensor.device)
+            if flat.size(1) > target_dim:
+                logging.warning(
+                    f"[Agent {agent_id}] one-hot overflow {flat.size(1)}>{target_dim}, truncating."
+                )
+                flat = flat[:, :target_dim]
+            elif flat.size(1) < target_dim:
+                pad_dim = target_dim - flat.size(1)
+                padding = torch.zeros(h_tensor.size(0), pad_dim, device=device, dtype=dtype)
                 flat = torch.cat([flat, padding], dim=1)
             return torch.cat([h_tensor, flat], dim=1)
         else:
@@ -538,9 +550,23 @@ class NCMultiAgentPolicy(Policy):
             for k, n_id in enumerate(neighbor_indices):
                 act = actions_tensor[:, n_id]
                 n_dim = self.na_ls_ls[agent_id][k]
+                act = act.clamp_(0, n_dim - 1)
                 seg = F.one_hot(act, num_classes=n_dim).float()
                 segs.append(seg)
-            cat = torch.cat(segs, dim=1) if segs else torch.zeros(h_tensor.size(0), 0, device=actions_tensor.device)
+            cat = (
+                torch.cat(segs, dim=1)
+                if segs
+                else torch.zeros(h_tensor.size(0), 0, device=actions_tensor.device, dtype=dtype)
+            )
+            if cat.size(1) != target_dim:
+                if cat.size(1) > target_dim:
+                    logging.warning(
+                        f"[Agent {agent_id}] one-hot overflow {cat.size(1)}>{target_dim}, truncating."
+                    )
+                    cat = cat[:, :target_dim]
+                else:
+                    pad = torch.zeros(h_tensor.size(0), target_dim - cat.size(1), device=device, dtype=dtype)
+                    cat = torch.cat([cat, pad], dim=1)
             return torch.cat([h_tensor, cat], dim=1)
 
     def _init_actor_head(self, n_a):
@@ -878,7 +904,7 @@ class NCMultiAgentPolicy(Policy):
             logging.info(f"Creating fc_x layer: {key} (in={n_ns})")
             layer = nn.Linear(n_ns, self.n_fc)
             init_layer(layer, 'fc')
-            layer = layer.to(self.zero_pad.device)
+            layer = layer.to(self.device)
             self.fc_x_layers[key] = layer
         else:
             assert self.fc_x_layers[key].in_features == n_ns, \
