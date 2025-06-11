@@ -218,18 +218,26 @@ class NCMultiAgentPolicy(Policy):
         logging.info(f"DEBUG: self.use_gat evaluated to: {self.use_gat}")
 
         self._init_net() # self.use_gat is now set before this call
+
+        if list(self.parameters()):
+            self.device = next(self.parameters()).device
+        else:
+            # If no parameters (e.g. GAT disabled and no other layers yet)
+            self.device = torch.device("cpu")
+            logging.warning(f"[{self.name}] No parameters found after _init_net. Defaulting device to CPU.")
+
         self._reset()
         self.zero_pad = nn.Parameter(torch.zeros(1, 2*self.n_fc), requires_grad=False)
         self.latest_attention_scores = None
 
-        # capture device placeholder; real device set when model.to(device) is called
-        # This needs to be after _init_net() as parameters are created there
-        if list(self.parameters()):
-             self.device = next(self.parameters()).device
-        else:
-             # If no parameters (e.g. GAT disabled and no other layers yet)
-             self.device = torch.device("cpu") # Default to CPU
-             logging.warning(f"[{self.name}] No parameters found after _init_net. Defaulting device to CPU.")
+    @property
+    def dev(self):
+        """Current device inferred from parameters."""
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return getattr(self, "device", torch.device("cpu"))
+
 
     def backward(self, obs, fps, acts, dones, Rs, Advs,
                  e_coef, v_coef, summary_writer=None, global_step=None):
@@ -254,7 +262,8 @@ class NCMultiAgentPolicy(Policy):
         vs_list_N_of_T = []
         for i in range(self.n_agent):
             critic_input_i = self._build_value_input(hs_N_T_H[i], acts_T_N, i)
-            val_i_T = self.ppo_value_heads[i](critic_input_i).squeeze(-1)
+            head = self.ppo_value_heads[0] if self.identical else self.ppo_value_heads[i]
+            val_i_T = head(critic_input_i).squeeze(-1)
             vs_list_N_of_T.append(val_i_T)
         vs_T_N = torch.stack(vs_list_N_of_T, dim=1)
 
@@ -270,7 +279,8 @@ class NCMultiAgentPolicy(Policy):
                 self._run_loss(actor_dist_i, e_coef, v_coef, vs_T_N[:, i], 
                     acts_T_N[:, i], Rs_T_N[:, i], Advs_T_N[:, i])
             self.policy_loss += policy_loss_i
-            self.value_loss += value_loss_i
+            scale = 1.0 / self.n_agent if self.identical else 1.0
+            self.value_loss += value_loss_i * scale
             self.entropy_loss += entropy_loss_i
         self.loss = self.policy_loss + self.value_loss + self.entropy_loss
         self.loss.backward()
@@ -321,7 +331,8 @@ class NCMultiAgentPolicy(Policy):
 
         actor_logits_list_N_of_A = []
         for i in range(self.n_agent):
-            actor_logits_list_N_of_A.append(self.actor_heads[i](h_states_N_H[i, :].unsqueeze(0)))
+            head = self.actor_heads[0] if self.identical else self.actor_heads[i]
+            actor_logits_list_N_of_A.append(head(h_states_N_H[i, :].unsqueeze(0)))
 
         value_list_N_of_1 = None
         if neighbor_actions_N is not None:
@@ -330,7 +341,8 @@ class NCMultiAgentPolicy(Policy):
             for i in range(self.n_agent):
                 h_i = h_states_N_H[i, :].unsqueeze(0)  # (1, H)
                 critic_input_i = self._build_value_input(h_i, act_tensor, i)
-                v_i = self.ppo_value_heads[i](critic_input_i).squeeze(-1)
+                head = self.ppo_value_heads[0] if self.identical else self.ppo_value_heads[i]
+                v_i = head(critic_input_i).squeeze(-1)
                 value_list_N_of_1.append(v_i)
 
         probs_list_N_of_A = [F.softmax(logits.squeeze(0), dim=-1) for logits in actor_logits_list_N_of_A]
@@ -363,7 +375,7 @@ class NCMultiAgentPolicy(Policy):
         """
         B, N, _ = obs_B_N_D.shape                       # 取 batch 與 agent 數
 
-        actions_B_N = actions_B_N.to(obs_B_N_D.device)
+        actions_B_N = actions_B_N.to(obs_B_N_D.device).long()
 
         # --- 1) 先拿到 (N,B,H) → 轉 (B,N,H) ---
         h_N_B_H, lstm_states_new = self._run_comm_layers(
@@ -381,9 +393,10 @@ class NCMultiAgentPolicy(Policy):
                 self._build_value_input(h_B_N_H[:, i, :], actions_B_N, i)
                 for i in range(self.n_agent)
             ]
-            critic_input_flat = torch.cat(critic_inputs_list, dim=0)  # (B*N, D)
-            values_flat = self.ppo_value_heads[0](critic_input_flat).squeeze(-1)
-            values_B_N = values_flat.view(B, N)
+            values_cols = [
+                self.ppo_value_heads[0](ci).squeeze(-1) for ci in critic_inputs_list
+            ]
+            values_B_N = torch.stack(values_cols, dim=1)
 
             flat_logits  = logits_B_N_A.reshape(-1, logits_B_N_A.size(-1)) # (B*N, A)
             flat_actions = actions_B_N.reshape(-1) # (B*N)
@@ -534,7 +547,7 @@ class NCMultiAgentPolicy(Policy):
 
         if self.identical:
             neighbor_actions = actions_tensor[:, neighbor_indices]
-            neighbor_actions = neighbor_actions.clamp_(0, self.n_a - 1)
+            neighbor_actions = neighbor_actions.clamp(0, self.n_a - 1)
             one_hot = F.one_hot(neighbor_actions, num_classes=self.n_a).to(dtype)
             flat = one_hot.view(h_tensor.size(0), -1)
             if flat.size(1) > target_dim:
@@ -552,7 +565,7 @@ class NCMultiAgentPolicy(Policy):
             for k, n_id in enumerate(neighbor_indices):
                 act = actions_tensor[:, n_id]
                 n_dim = self.na_ls_ls[agent_id][k]
-                act = act.clamp_(0, n_dim - 1)
+                act = act.clamp(0, n_dim - 1)
                 seg = F.one_hot(act, num_classes=n_dim).to(dtype)
                 segs.append(seg)
             cat = (
@@ -632,6 +645,8 @@ class NCMultiAgentPolicy(Policy):
                 max_n_na = max(n_na_candidates)
             self.shared_value_head = nn.Linear(self.n_h + max_n_na, 1)
             init_layer(self.shared_value_head, 'fc')
+            self._init_actor_head(self.n_a)
+            self.ppo_value_heads = nn.ModuleList([self.shared_value_head])
 
         for i in range(self.n_agent):
             n_n, n_ns, n_na, ns_ls, na_ls = self._get_neighbor_dim(i)
@@ -649,12 +664,9 @@ class NCMultiAgentPolicy(Policy):
                 self.fc_m_layers.append(None)
                 self.fc_p_layers.append(None)
 
-            n_a = self.n_a if self.identical else self.n_a_ls[i]
-            self._init_actor_head(n_a)
-
-            if self.identical:
-                self.ppo_value_heads.append(self.shared_value_head)
-            else:
+            if not self.identical:
+                n_a = self.n_a_ls[i]
+                self._init_actor_head(n_a)
                 ppo_v = nn.Linear(self.n_h + n_na, 1)
                 init_layer(ppo_v, 'fc')
                 self.ppo_value_heads.append(ppo_v)
@@ -665,34 +677,22 @@ class NCMultiAgentPolicy(Policy):
             logging.warning(f"[{self.name}] cannot infer device in _init_net.")
 
         # Cache neighbor indices as a list of LongTensors
-        self.neighbor_index_ls = [
-            torch.from_numpy(np.where(mask)[0]).long()
-            for mask in self.neighbor_mask
-        ]
-        # Note: These tensors in neighbor_index_ls are on CPU by default.
-        # They will be moved to the correct device in _get_comm_s using .to(device).
+        self.neighbor_index_ls = []
+        for idx, mask in enumerate(self.neighbor_mask):
+            tensor = torch.from_numpy(np.where(mask)[0]).long()
+            self.register_buffer(f'neighbor_index_{idx}', tensor)
+            self.neighbor_index_ls.append(tensor)
 
     def _reset(self):
-        if not hasattr(self, 'device') or self.device is None:
-            logging.error(f"Device not properly set for NCMultiAgentPolicy instance {self.name} during _reset. Attempting to infer or defaulting to CPU.")
-            try:
-                current_device = next(self.parameters()).device
-                logging.info(f"Inferred device {current_device} for {self.name} in _reset.")
-                self.device = current_device
-            except StopIteration:
-                logging.error(f"Could not infer device for {self.name} from parameters in _reset. Defaulting to CPU.")
-                current_device = torch.device("cpu")
-                self.device = current_device
-        else:
-            current_device = self.device
-
+        current_device = self.dev
         self.states_fw = torch.zeros(self.n_agent, self.n_h * 2, device=current_device)
         self.states_bw = torch.zeros(self.n_agent, self.n_h * 2, device=current_device)
 
     def _run_actor_heads(self, hs, detach=False):
         logits_list = []
         for i in range(self.n_agent):
-            logits_i = self.actor_heads[i](hs[i])
+            head = self.actor_heads[0] if self.identical else self.actor_heads[i]
+            logits_i = head(hs[i])
             if detach:
                 logits_list.append(logits_i.cpu().detach().numpy())
             else:
@@ -909,8 +909,7 @@ class NCMultiAgentPolicy(Policy):
             logging.info(f"Creating fc_x layer: {key} (in={n_ns})")
             layer = nn.Linear(n_ns, self.n_fc)
             init_layer(layer, 'fc')
-            tmp_dev = self.device if getattr(self, 'device', None) else torch.device('cpu')
-            layer = layer.to(tmp_dev)
+            layer = layer.to(self.dev)
             self.fc_x_layers[key] = layer
         else:
             assert self.fc_x_layers[key].in_features == n_ns, \
