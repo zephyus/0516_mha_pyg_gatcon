@@ -83,71 +83,136 @@ url={https://openreview.net/forum?id=Syx7A3NFvH}
 
 --- Run on docker instructions ---
 
-#######今天遇到一台新電腦#################
-建置docker環境
-########################################
+以下是針對您新的實驗資料夾與設定檔 `/home/russell512/deeprl_0611_ppo/config/config_mappo_nc_net_exp_0519.ini` 的完整操作指引，已將相關路徑與容器名稱更新：
 
-1. create folder best_environment
-2. 把 docker file 放到 best_environment
-3. docker build -t best_environment:latest .
+---
 
+## ✅ **完全 WORK for PPO 實驗 - deeprl\_0611\_ppo**
 
-#########################################
-docker 啟動!
-########################################
+### 🎯目標：使用 Docker + tmux 讓訓練在背景穩定持續執行，不受 SSH 斷線影響
 
+---
 
-cd best_environment
--
-docker run --gpus all -it -v /home/russell512/my_deeprl_network_ori_test:/workspace/my_deeprl_network best_environment:latest /bin/bash
--
-pip install traci
-pip install sumolib
-pip install torch
-cd my_deeprl_network
+## **更新參數說明**
+
+* **專案資料夾**：`/home/russell512/deeprl_0611_ppo`
+* **config 檔案**：`config/config_mappo_nc_net_exp_0519.ini`
+* **容器名稱建議**：`Trainer_PPO_0611`
+* **TensorBoard logdir**：`/home/russell512/deeprl_0611_ppo/real_a1`
+* **Port 建議**：199（避免與其他實驗衝突）
+
+---
+
+### 🧱 **第 1 步：建置 Docker Image**
+
+```bash
+cd ~/best_environment
+docker build -t best_environment:latest .
+```
+
+---
+
+### 🚀 **第 2 步：啟動背景容器**
+
+```bash
+docker run \
+  --gpus all \
+  -d \
+  --name Trainer_PPO_0611 \
+  -v /home/russell512/deeprl_0611_ppo:/workspace/my_deeprl_network \
+  best_environment:latest \
+  sleep infinity
+```
+
+---
+
+### 🔧 **第 3 步：進入容器**
+
+```bash
+docker exec -it Trainer_PPO_0611 /bin/bash
+```
+
+---
+
+### 🔩 **第 4 步：環境設置**
+
+```bash
+pip install traci sumolib torch
+
+cd /workspace/my_deeprl_network
+
 export SUMO_HOME="/root/miniconda/envs/py36/share/sumo"
 
-
-##########################################
-進行訓練
-###########################################  nc 10次版本 #####可以正常運行
-python3 test.py --base-dir real_a1/nc_ten_times/ --port 189 train --config-dir config/config_ma2c_nc_net_ten_times.ini
-####################################
-python3 test.py --base-dir real_a1/ma2c_nclm_net_ten_times/ --port 189 train --config-dir config/config_ma2c_nclm_net_ten_times.ini
-###########################################背景
 apt update
 apt install -y tmux
-tmux new -s mysession
-python3 test.py --base-dir real_a1/nc_ten_times_0417/ --port 189 train --config-dir config/config_ma2c_nc_net_ten_times.ini
-要離開（但讓它繼續跑）：
-Ctrl + b 然後按 d
-再次連線後，用以下指令回來：
-tmux attach -t mysession
+```
 
+---
 
-python3 test.py --base-dir real_a1/ma2c_nclm_smallgrid/ --port 189 train --config-dir config/config_ma2c_nclm_smallgrid.ini
+### 🧠 **第 5 步：啟動訓練 (tmux)**
 
-python3 test.py --base-dir real_a1/ma2c_nc_smallgrid/ --port 189 train --config-dir config/config_ma2c_nc_smallgrid.ini
+```bash
+tmux new -s training_ppo_0611
+```
 
-python3 test.py --base-dir real_a1/ma2c_nc_grid/ --port 189 train --config-dir config/config_ma2c_nc_grid.ini
+接著在 tmux 中執行：
 
-高雄專用
-python3 test.py --base-dir training/kao/thousandtimes --port 189 train --config-dir config/config_ma2c_nclm_kao.ini
+```bash
+mkdir -p real_a1/log
 
-##########################################
-Evaluation
-###########################################
-python3 test.py --base-dir real_a1/ma2c_nclm evaluate --evaluation-seeds 2000
+export USE_GAT=1
+python3 test.py \
+  --base-dir real_a1 \
+  --port 199 \
+  train \
+  --config-dir config/config_mappo_nc_net_exp_0519.ini \
+  > real_a1/log/training_ppo_0611_$(date +%Y%m%d_%H%M%S).log 2>&1
+```
 
-###
-背景訓練 (其實到現在我(廖珈鋒)還是不會用)：
-nohup python3 test.py --base-dir real_a1/ma2c_nclm --port 189 train --config-dir config/config_ma2c_nclm_net_ten_times.ini > output.log 2>&1 &
-終止：
-ps aux | grep test.py
-kill -9 <PID>
+---
 
-############
-checkpoint一般來說是打不開，要用torch.load讀出來，才能知道
-到底存了啥進去，我有打一個load.py來讀，如果不見了請自己打一個
-############
+### 🔚 **第 6、7 步：分離並退出容器**
+
+```bash
+# 在 tmux 裡按：Ctrl + b，然後按 d 鍵
+exit  # 回到主機
+```
+
+---
+
+### 📶 **第 8 步：安全地斷線 SSH**
+
+您現在可以放心中斷 SSH 連線了，訓練仍會在容器 + tmux 中持續執行。
+
+---
+
+### 🔁 **第 9 步：重新連線查看訓練**
+
+```bash
+ssh <your-server>
+
+docker exec -it Trainer_PPO_0611 /bin/bash
+
+tmux attach -t training_ppo_0611
+```
+
+---
+
+### 📈 **啟動 TensorBoard 監控**
+
+```bash
+tensorboard --logdir=/home/russell512/deeprl_0611_ppo/real_a1 --port=6009
+```
+
+然後瀏覽器開啟：
+[http://localhost:6009](http://localhost:6009)
+
+---
+
+### 🧹 **監控訓練程序**
+
+```bash
+ps -eo pid,user,%cpu,%mem,cmd | grep python | grep -v grep
+```
+
 
