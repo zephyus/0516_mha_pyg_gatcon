@@ -212,6 +212,8 @@ class NCMultiAgentPolicy(Policy):
         )
         # self.use_gat will be True if GATConv is available AND environment variable is '1'
         self.use_gat = (GATConv is not None) and (use_gat_env_value == '1')
+        # persist this flag in checkpoints to detect mismatches when loading
+        self.register_buffer('use_gat_flag', torch.tensor(int(self.use_gat), dtype=torch.uint8))
         if GATConv is None and use_gat_env_value == '1':
             logging.warning("USE_GAT is '1' but torch_geometric is not installed. GAT will be disabled.")
         
@@ -237,6 +239,15 @@ class NCMultiAgentPolicy(Policy):
             return next(self.parameters()).device
         except StopIteration:
             return getattr(self, "device", torch.device("cpu"))
+
+    def load_state_dict(self, state_dict, strict=True):
+        if 'use_gat_flag' in state_dict:
+            loaded = bool(state_dict['use_gat_flag'])
+            if loaded != self.use_gat:
+                raise ValueError(
+                    f"use_gat mismatch: checkpoint expects {loaded} but model is configured with {self.use_gat}"
+                )
+        return super().load_state_dict(state_dict, strict)
 
 
     def backward(self, obs, fps, acts, dones, Rs, Advs,
@@ -279,8 +290,7 @@ class NCMultiAgentPolicy(Policy):
                 self._run_loss(actor_dist_i, e_coef, v_coef, vs_T_N[:, i], 
                     acts_T_N[:, i], Rs_T_N[:, i], Advs_T_N[:, i])
             self.policy_loss += policy_loss_i
-            scale = 1.0 / self.n_agent if self.identical else 1.0
-            self.value_loss += value_loss_i * scale
+            self.value_loss += value_loss_i
             self.entropy_loss += entropy_loss_i
         self.loss = self.policy_loss + self.value_loss + self.entropy_loss
         self.loss.backward()
@@ -472,14 +482,16 @@ class NCMultiAgentPolicy(Policy):
 
         # ── project fingerprints safely ──
         if n_n > 0 and self.fc_p_layers[i] is not None and p_cat_for_fc is not None:
-            if p_cat_for_fc.size(1) == self.fc_p_layers[i].in_features:
-                p_proj = F.relu(self.fc_p_layers[i](p_cat_for_fc.to(device)))
-            else:
+            in_dim = self.fc_p_layers[i].in_features
+            if p_cat_for_fc.size(1) > in_dim:
                 logging.warning(
-                    f"Agent {i}: fc_p_layer.in_features={self.fc_p_layers[i].in_features}, "
-                    f"got {p_cat_for_fc.size(1)} → zeros fallback."
+                    f"Agent {i}: fingerprint dim {p_cat_for_fc.size(1)} exceeds {in_dim}, truncating"
                 )
-                p_proj = torch.zeros(1, self.n_fc, device=device)
+                p_cat_for_fc = p_cat_for_fc[:, :in_dim]
+            elif p_cat_for_fc.size(1) < in_dim:
+                pad = torch.zeros(1, in_dim - p_cat_for_fc.size(1), device=device)
+                p_cat_for_fc = torch.cat([p_cat_for_fc, pad], dim=1)
+            p_proj = F.relu(self.fc_p_layers[i](p_cat_for_fc.to(device)))
         else:
             # no neighbors or no valid fingerprint → zeros
             p_proj = torch.zeros(1, self.n_fc, device=device)
@@ -559,6 +571,7 @@ class NCMultiAgentPolicy(Policy):
                 pad_dim = target_dim - flat.size(1)
                 padding = torch.zeros(h_tensor.size(0), pad_dim, device=device, dtype=dtype)
                 flat = torch.cat([flat, padding], dim=1)
+            assert flat.size(1) == target_dim
             return torch.cat([h_tensor, flat], dim=1)
         else:
             segs = []
@@ -573,15 +586,15 @@ class NCMultiAgentPolicy(Policy):
                 if segs
                 else torch.zeros(h_tensor.size(0), 0, device=actions_tensor.device, dtype=dtype)
             )
-            if cat.size(1) != target_dim:
-                if cat.size(1) > target_dim:
-                    logging.warning(
-                        f"[Agent {agent_id}] one-hot overflow {cat.size(1)}>{target_dim}, truncating."
-                    )
-                    cat = cat[:, :target_dim]
-                else:
-                    pad = torch.zeros(h_tensor.size(0), target_dim - cat.size(1), device=device, dtype=dtype)
-                    cat = torch.cat([cat, pad], dim=1)
+            if cat.size(1) > target_dim:
+                logging.warning(
+                    f"[Agent {agent_id}] one-hot overflow {cat.size(1)}>{target_dim}, truncating."
+                )
+                cat = cat[:, :target_dim]
+            elif cat.size(1) < target_dim:
+                pad = torch.zeros(h_tensor.size(0), target_dim - cat.size(1), device=device, dtype=dtype)
+                cat = torch.cat([cat, pad], dim=1)
+            assert cat.size(1) == target_dim
             return torch.cat([h_tensor, cat], dim=1)
 
     def _init_actor_head(self, n_a):
@@ -640,9 +653,8 @@ class NCMultiAgentPolicy(Policy):
 
         max_n_na = 0
         if self.identical:
-            n_na_candidates = [self._get_neighbor_dim(i)[2] for i in range(self.n_agent)]
-            if n_na_candidates:
-                max_n_na = max(n_na_candidates)
+            # Use the theoretical maximum so future topology changes won't exceed the head's capacity
+            max_n_na = (self.n_agent - 1) * self.n_a
             self.shared_value_head = nn.Linear(self.n_h + max_n_na, 1)
             init_layer(self.shared_value_head, 'fc')
             self._init_actor_head(self.n_a)
@@ -654,7 +666,10 @@ class NCMultiAgentPolicy(Policy):
             self.na_ls_ls.append(na_ls)
             self.n_n_ls.append(n_n)
             if n_n:
-                fc_p_layer = nn.Linear(n_na, self.n_fc)
+                max_dim = n_na
+                if self.identical:
+                    max_dim = (self.n_agent - 1) * self.n_a
+                fc_p_layer = nn.Linear(max_dim, self.n_fc)
                 init_layer(fc_p_layer, 'fc')
                 fc_m_layer = nn.Linear(self.n_h * n_n, self.n_fc)
                 init_layer(fc_m_layer, 'fc')
@@ -779,6 +794,15 @@ class NCMultiAgentPolicy(Policy):
 
             # fingerprint / hidden‐msg 投影
             if n_n and self.fc_p_layers[i] is not None and fps_dim:
+                in_dim = self.fc_p_layers[i].in_features
+                if p_i_flat.size(1) > in_dim:
+                    logging.warning(
+                        f"Agent {i}: fingerprint dim {p_i_flat.size(1)} exceeds {in_dim}, truncating"
+                    )
+                    p_i_flat = p_i_flat[:, :in_dim]
+                elif p_i_flat.size(1) < in_dim:
+                    pad = torch.zeros(T, in_dim - p_i_flat.size(1), device=device)
+                    p_i_flat = torch.cat([p_i_flat, pad], dim=1)
                 p_proj = F.relu(self.fc_p_layers[i](p_i_flat))
             else:
                 p_proj = torch.zeros(T, n_fc, device=device)
